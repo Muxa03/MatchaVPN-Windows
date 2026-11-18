@@ -29,13 +29,14 @@ public sealed class SingBoxTunnelController : ITunnelController
     private static string LogPath =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MatchaLab", "singbox.log");
 
-    public async Task StartAsync(string singBoxJson)
+    public async Task StartAsync(string singBoxJson, CancellationToken cancellationToken = default)
     {
         Set(TunnelStatus.Connecting);
         try
         {
             await Task.Run(() =>
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var exeDir = DeployBinaries();
                 Directory.CreateDirectory(ConfDir);
                 File.WriteAllText(ConfPath, singBoxJson);
@@ -61,6 +62,7 @@ public sealed class SingBoxTunnelController : ITunnelController
                 var deadline = DateTime.UtcNow.AddSeconds(25);
                 while (DateTime.UtcNow < deadline)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     if (AdapterPresent()) { Thread.Sleep(300); return; }
                     if (proc.HasExited)
                         throw new InvalidOperationException(
@@ -74,7 +76,7 @@ public sealed class SingBoxTunnelController : ITunnelController
         catch
         {
             await Task.Run(SafeStop);
-            Set(TunnelStatus.Error);
+            Set(cancellationToken.IsCancellationRequested ? TunnelStatus.Disconnected : TunnelStatus.Error);
             throw;
         }
         _rx = _tx = 0;

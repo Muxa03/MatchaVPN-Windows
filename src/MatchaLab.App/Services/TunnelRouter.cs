@@ -32,13 +32,14 @@ public sealed class TunnelRouter : ITunnelController, IProtocolRouter
     public ulong TxBytes => _active.TxBytes;
     public event Action<TunnelStatus>? StatusChanged;
 
-    public async Task StartAsync(string config)
+    public async Task StartAsync(string config, CancellationToken cancellationToken = default)
     {
         var target = Target;
         if (_active != target && _active.Status != TunnelStatus.Disconnected)
             await _active.StopAsync();
+        cancellationToken.ThrowIfCancellationRequested();
         _active = target;
-        await target.StartAsync(config);
+        await target.StartAsync(config, cancellationToken);
     }
 
     public Task StopAsync() => _active.StopAsync();

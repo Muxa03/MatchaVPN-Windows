@@ -17,7 +17,7 @@ public sealed class ApiClient
         using var req = new HttpRequestMessage(HttpMethod.Get, $"{BaseUrl}/catalog");
         req.Headers.Add("X-Token", token);
         using var resp = await _http.SendAsync(req, ct);
-        if (!resp.IsSuccessStatusCode) return null;
+        resp.EnsureSuccessStatusCode();
         return await resp.Content.ReadFromJsonAsync<Catalog>(cancellationToken: ct);
     }
 
@@ -29,7 +29,7 @@ public sealed class ApiClient
         req.Content = new StringContent(
             JsonSerializer.Serialize(new { server, proto }), Encoding.UTF8, "application/json");
         using var resp = await _http.SendAsync(req, ct);
-        if (!resp.IsSuccessStatusCode) return null;
+        resp.EnsureSuccessStatusCode();
         var r = await resp.Content.ReadFromJsonAsync<ResolveResp>(cancellationToken: ct);
         return string.IsNullOrEmpty(r?.Config) ? null : r!.Config;
     }
@@ -37,6 +37,7 @@ public sealed class ApiClient
     public async Task<ServicesResp?> GetServicesAsync(CancellationToken ct = default)
     {
         try { return await _http.GetFromJsonAsync<ServicesResp>($"{BaseUrl}/services", ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch { return null; }
     }
 }

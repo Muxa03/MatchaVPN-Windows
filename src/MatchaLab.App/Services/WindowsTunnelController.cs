@@ -7,6 +7,7 @@ using System.Runtime.Versioning;
 using System.ServiceProcess;
 using System.Text;
 using Avalonia.Threading;
+using TimeoutException = System.TimeoutException;
 
 namespace MatchaLab.App.Services;
 
@@ -18,6 +19,7 @@ public sealed class WindowsTunnelController : ITunnelController
     private const string AdapterName = "MatchaLab";
     private System.Timers.Timer? _monitor;
     private int _polling;
+    private readonly object _lifecycle = new();
     private ulong _rx, _tx;
     private long _lastHandshake;
     private string? _uapiPrefix;
@@ -44,7 +46,7 @@ public sealed class WindowsTunnelController : ITunnelController
         }
     }
 
-    public async Task StartAsync(string awgConfig)
+    public async Task StartAsync(string awgConfig, CancellationToken cancellationToken = default)
     {
         _lastConfig = awgConfig;
         _endpointAddr = ParseEndpointAddr(awgConfig);
@@ -53,6 +55,7 @@ public sealed class WindowsTunnelController : ITunnelController
         {
             await Task.Run(() =>
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 var exeDir = Path.GetDirectoryName(Environment.ProcessPath) ?? AppContext.BaseDirectory;
                 foreach (var dll in new[] { "tunnel.dll", "wintun.dll" })
                 {
@@ -69,38 +72,22 @@ public sealed class WindowsTunnelController : ITunnelController
 
                 Directory.CreateDirectory(ConfDir);
                 RestrictAcl(ConfDir);
-                File.WriteAllText(ConfPath, awgConfig);
                 RemoveService();
                 WaitAdapterGone();
+                cancellationToken.ThrowIfCancellationRequested();
+                File.WriteAllText(ConfPath, awgConfig);
                 AddEndpointRoute();
                 InstallService();
                 using var sc = new ServiceController(ServiceName);
                 sc.Start();
-                sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(20));
-
-                _lastHandshake = 0; _uapiPrefix = null;
-                var deadline = DateTime.UtcNow.AddSeconds(15);
-                var sawUapi = false;
-                while (DateTime.UtcNow < deadline)
-                {
-                    if (TryUapiStats()) { sawUapi = true; if (_lastHandshake > 0) break; }
-                    Thread.Sleep(500);
-                }
-                if (!sawUapi)
-                    throw new System.TimeoutException(
-                        "Служба туннеля не поднялась (сетевой адаптер не создался). " +
-                        "Подождите пару секунд и попробуйте снова.");
-                if (_lastHandshake == 0)
-                    throw new System.TimeoutException(
-                        "Туннель запущен, но сервер не ответил на рукопожатие. Если параллельно работает " +
-                        "другой VPN (AmneziaVPN и т.п.) - отключите его. Иначе проверьте сеть или смените сервер.");
-                PreferTunnelInterface();
+                WaitForHandshake(sc, cancellationToken);
             });
         }
         catch
         {
             await Task.Run(SafeRemove);
-            Set(TunnelStatus.Error);
+            _lastConfig = null;
+            Set(cancellationToken.IsCancellationRequested ? TunnelStatus.Disconnected : TunnelStatus.Error);
             throw;
         }
         _rx = _tx = 0;
@@ -110,9 +97,15 @@ public sealed class WindowsTunnelController : ITunnelController
 
     public async Task StopAsync()
     {
-        _lastConfig = null;
         StopMonitor();
-        await Task.Run(SafeRemove);
+        await Task.Run(() =>
+        {
+            lock (_lifecycle)
+            {
+                _lastConfig = null;
+                SafeRemove();
+            }
+        });
         _rx = _tx = 0;
         _lastHandshake = 0;
         Set(TunnelStatus.Disconnected);
@@ -141,11 +134,21 @@ public sealed class WindowsTunnelController : ITunnelController
     {
         if (_monitor is not null) return;
         _monitor = new System.Timers.Timer(1000);
-        _monitor.Elapsed += (_, _) => Poll();
+        _monitor.Elapsed += (sender, _) =>
+        {
+            lock (_lifecycle)
+            {
+                if (ReferenceEquals(sender, _monitor)) Poll();
+            }
+        };
         _monitor.Start();
     }
 
-    private void StopMonitor() { _monitor?.Stop(); _monitor?.Dispose(); _monitor = null; }
+    private void StopMonitor()
+    {
+        var monitor = Interlocked.Exchange(ref _monitor, null);
+        monitor?.Dispose();
+    }
 
     private void Poll()
     {
@@ -156,6 +159,7 @@ public sealed class WindowsTunnelController : ITunnelController
             {
                 if (_lastConfig is { } cfg && TryRestartService(cfg)) return;
                 StopMonitor();
+                _lastConfig = null;
                 _lastHandshake = 0;
                 Set(TunnelStatus.Disconnected);
                 return;
@@ -184,15 +188,14 @@ public sealed class WindowsTunnelController : ITunnelController
         {
             Directory.CreateDirectory(ConfDir);
             RestrictAcl(ConfDir);
-            File.WriteAllText(ConfPath, cfg);
             RemoveService();
             WaitAdapterGone();
+            File.WriteAllText(ConfPath, cfg);
             AddEndpointRoute();
             InstallService();
             using var sc = new ServiceController(ServiceName);
             sc.Start();
-            sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(20));
-            PreferTunnelInterface();
+            WaitForHandshake(sc, CancellationToken.None);
             Set(TunnelStatus.Connected);
             return true;
         }
@@ -201,6 +204,47 @@ public sealed class WindowsTunnelController : ITunnelController
             SafeRemove();
             return false;
         }
+    }
+
+    private void WaitForHandshake(ServiceController service, CancellationToken cancellationToken)
+    {
+        var serviceWait = Stopwatch.StartNew();
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            service.Refresh();
+            if (service.Status == ServiceControllerStatus.Running) break;
+            if (service.Status == ServiceControllerStatus.Stopped || serviceWait.Elapsed >= TimeSpan.FromSeconds(20))
+                throw new TimeoutException("Служба AmneziaWG не запустилась. Проверьте установку и права администратора.");
+            cancellationToken.WaitHandle.WaitOne(250);
+        }
+
+        _lastHandshake = 0;
+        _uapiPrefix = null;
+        var handshakeWait = Stopwatch.StartNew();
+        bool adapterResponded = false;
+        while (handshakeWait.Elapsed < TimeSpan.FromSeconds(15))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            service.Refresh();
+            if (service.Status != ServiceControllerStatus.Running)
+                throw new InvalidOperationException("Служба AmneziaWG остановилась при подключении.");
+            if (TryUapiStats())
+            {
+                adapterResponded = true;
+                if (_lastHandshake > 0)
+                {
+                    PreferTunnelInterface();
+                    cancellationToken.ThrowIfCancellationRequested();
+                    return;
+                }
+            }
+            cancellationToken.WaitHandle.WaitOne(500);
+        }
+
+        if (!adapterResponded)
+            throw new TimeoutException("Служба запущена, но адаптер AmneziaWG не отвечает. Проверьте установку клиента.");
+        throw new TimeoutException("Сервер AmneziaWG не ответил на прямое подключение (UDP). Попробуйте другую локацию или сеть.");
     }
 
     private void ReadStats()
@@ -228,21 +272,10 @@ public sealed class WindowsTunnelController : ITunnelController
             try
             {
                 using var pipe = new NamedPipeClientStream(
-                    ".", $"ProtectedPrefix\\Administrators\\{prefix}\\{AdapterName}", PipeDirection.InOut);
-                pipe.Connect(250);
-                var req = Encoding.ASCII.GetBytes("get=1\n\n");
-                pipe.Write(req, 0, req.Length);
-                using var r = new StreamReader(pipe, Encoding.ASCII);
-                ulong rx = 0, tx = 0;
-                long hs = 0;
-                string? line;
-                while ((line = r.ReadLine()) is not null && line.Length > 0)
-                {
-                    if (line.StartsWith("rx_bytes=")) rx += ulong.Parse(line["rx_bytes=".Length..]);
-                    else if (line.StartsWith("tx_bytes=")) tx += ulong.Parse(line["tx_bytes=".Length..]);
-                    else if (line.StartsWith("last_handshake_time_sec="))
-                        hs = Math.Max(hs, long.Parse(line["last_handshake_time_sec=".Length..]));
-                }
+                    ".", $"ProtectedPrefix\\Administrators\\{prefix}\\{AdapterName}",
+                    PipeDirection.InOut, PipeOptions.Asynchronous);
+                using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(750));
+                var (rx, tx, hs) = ReadUapiAsync(pipe, deadline.Token).GetAwaiter().GetResult();
                 _uapiPrefix = prefix;
                 _rx = rx; _tx = tx; _lastHandshake = hs;
                 return true;
@@ -252,12 +285,33 @@ public sealed class WindowsTunnelController : ITunnelController
         return false;
     }
 
+    private static async Task<(ulong Rx, ulong Tx, long Handshake)> ReadUapiAsync(
+        NamedPipeClientStream pipe, CancellationToken cancellationToken)
+    {
+        await pipe.ConnectAsync(250, cancellationToken).ConfigureAwait(false);
+        await pipe.WriteAsync(Encoding.ASCII.GetBytes("get=1\n\n"), cancellationToken).ConfigureAwait(false);
+        using var reader = new StreamReader(pipe, Encoding.ASCII);
+        ulong rx = 0, tx = 0;
+        long handshake = 0;
+        var acknowledged = false;
+        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { Length: > 0 } line)
+        {
+            if (line.StartsWith("rx_bytes=")) rx += ulong.Parse(line["rx_bytes=".Length..]);
+            else if (line.StartsWith("tx_bytes=")) tx += ulong.Parse(line["tx_bytes=".Length..]);
+            else if (line.StartsWith("last_handshake_time_sec="))
+                handshake = Math.Max(handshake, long.Parse(line["last_handshake_time_sec=".Length..]));
+            else if (line == "errno=0") acknowledged = true;
+        }
+        if (!acknowledged) throw new IOException("AmneziaWG did not acknowledge the status query.");
+        return (rx, tx, handshake);
+    }
+
     private static bool IsServiceRunning()
     {
         try
         {
             using var sc = new ServiceController(ServiceName);
-            return sc.Status is ServiceControllerStatus.Running or ServiceControllerStatus.StartPending;
+            return sc.Status == ServiceControllerStatus.Running;
         }
         catch { return false; }
     }
@@ -373,7 +427,6 @@ public sealed class WindowsTunnelController : ITunnelController
         row.dwForwardProto = 3;
         row.dwForwardAge = 0;
         var err = CreateIpForwardEntry(ref row);
-        if (err == ERROR_OBJECT_ALREADY_EXISTS) err = SetIpForwardEntry(ref row);
         if (err == 0) _endpointRoute = row;
     }
 
@@ -386,13 +439,6 @@ public sealed class WindowsTunnelController : ITunnelController
             return;
         }
 
-        if (_endpointAddr == 0) return;
-        foreach (var r in ReadForwardTable())
-        {
-            if (r.dwForwardDest != _endpointAddr || r.dwForwardMask != uint.MaxValue || r.dwForwardProto != 3) continue;
-            var stale = r;
-            DeleteIpForwardEntry(ref stale);
-        }
     }
 
     private static MIB_IPFORWARDROW? FindDefaultRoute(int excludeIfIndex)
@@ -456,7 +502,6 @@ public sealed class WindowsTunnelController : ITunnelController
     }
 
     private const uint ERROR_INSUFFICIENT_BUFFER = 122;
-    private const uint ERROR_OBJECT_ALREADY_EXISTS = 5010;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MIB_IPFORWARDROW
@@ -471,9 +516,6 @@ public sealed class WindowsTunnelController : ITunnelController
 
     [DllImport("iphlpapi.dll")]
     private static extern uint CreateIpForwardEntry(ref MIB_IPFORWARDROW row);
-
-    [DllImport("iphlpapi.dll")]
-    private static extern uint SetIpForwardEntry(ref MIB_IPFORWARDROW row);
 
     [DllImport("iphlpapi.dll")]
     private static extern uint DeleteIpForwardEntry(ref MIB_IPFORWARDROW row);
