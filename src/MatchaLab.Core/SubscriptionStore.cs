@@ -1,3 +1,5 @@
+using System.Net;
+
 namespace MatchaLab.Core;
 
 public sealed class SubscriptionStore
@@ -28,8 +30,9 @@ public sealed class SubscriptionStore
     public void SetToken(string raw)
     {
         var t = ExtractToken(raw);
-        if (string.IsNullOrEmpty(t)) return;
+        if (string.IsNullOrEmpty(t) || t == Token) return;
         Token = t;
+        Servers = Array.Empty<CatalogServer>();
         _secret.Set(KToken, t);
     }
 
@@ -42,20 +45,49 @@ public sealed class SubscriptionStore
 
     public async Task RefreshCatalogAsync(CancellationToken ct = default)
     {
-        if (string.IsNullOrEmpty(Token)) return;
+        var token = Token;
+        if (string.IsNullOrEmpty(token)) return;
         Catalog? cat;
-        try { cat = await _api.GetCatalogAsync(Token, ct); }
-        catch { LastError = "Нет соединения с сервером - проверьте сеть"; return; }
-        if (cat is null) { LastError = "Ключ недействителен или срок истёк"; return; }
-        Servers = cat.Servers;
-        SelectedServerId ??= Servers.FirstOrDefault()?.Id;
+        try { cat = await _api.GetCatalogAsync(token, ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (HttpRequestException ex) when (ex.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            if (Token == token)
+            {
+                Servers = Array.Empty<CatalogServer>();
+                LastError = "Ключ недействителен или срок истёк";
+            }
+            return;
+        }
+        catch
+        {
+            if (Token == token) LastError = "Нет соединения с сервером - проверьте сеть";
+            return;
+        }
+        if (Token != token) return;
+        if (cat is null) { LastError = "Сервер вернул пустой каталог"; return; }
+        Servers = cat.Servers.Where(s => s.Protocols.Contains("amneziaWG") || s.Protocols.Contains("hysteria2")).ToList();
+        SelectedServerId = SelectedServer?.Id;
         LastError = null;
     }
 
     public async Task<string?> ResolveSelectedAsync(CancellationToken ct = default)
     {
         if (string.IsNullOrEmpty(Token) || SelectedServer is null) return null;
+        LastError = null;
         try { return await _api.ResolveAsync(Token, SelectedServer.Id, SelectedProtoId, ct); }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (HttpRequestException ex)
+        {
+            LastError = ex.StatusCode switch
+            {
+                HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden => "Ключ недействителен или срок истёк",
+                HttpStatusCode.NotFound => "Локация или протокол больше недоступны. Обновите список серверов.",
+                null => "Не удалось связаться с сервером подписок. Проверьте сеть.",
+                _ => "Сервер не выдал конфигурацию для этой локации. Попробуйте ещё раз.",
+            };
+            return null;
+        }
         catch { LastError = "Нет соединения с сервером - проверьте сеть"; return null; }
     }
 

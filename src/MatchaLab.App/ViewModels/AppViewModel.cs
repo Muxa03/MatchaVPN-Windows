@@ -21,6 +21,9 @@ public partial class AppViewModel : ObservableObject
     private int _tick;
     private string? _endpointHost;
     private bool _uiVisible = true;
+    private bool _updatingCatalog;
+    private readonly SemaphoreSlim _tunnelOperation = new(1, 1);
+    private CancellationTokenSource? _connecting;
 
     public event Action? KeyChanged;
 
@@ -32,7 +35,8 @@ public partial class AppViewModel : ObservableObject
     private TunnelStatus status = TunnelStatus.Disconnected;
 
     [ObservableProperty]
-    [NotifyPropertyChangedFor(nameof(CurrentFlag), nameof(CurrentCountry), nameof(CurrentCountryDisplay), nameof(CurrentCity))]
+    [NotifyPropertyChangedFor(nameof(CurrentFlag), nameof(CurrentCountry), nameof(CurrentCountryDisplay), nameof(CurrentCity),
+        nameof(CanUseHysteria2), nameof(CanUseMatchaWg))]
     private CatalogServer? selectedServer;
 
     [ObservableProperty] private bool ruEnabled = true;
@@ -74,6 +78,8 @@ public partial class AppViewModel : ObservableObject
 
     public bool IsMatchaWg => SelectedProto != "hysteria2";
     public bool IsHysteria2 => SelectedProto == "hysteria2";
+    public bool CanUseMatchaWg => SelectedServer?.Protocols.Contains("amneziaWG") == true;
+    public bool CanUseHysteria2 => SelectedServer?.Protocols.Contains("hysteria2") == true;
     public string ProtoName => IsHysteria2 ? "Hysteria2" : "MatchaWG";
     public string ProtoSubtitle => IsHysteria2 ? "QUIC · маскировка под HTTPS" : "обфускация трафика";
 
@@ -141,68 +147,112 @@ public partial class AppViewModel : ObservableObject
     private async Task LoadCatalogAsync()
     {
         await _sub.RefreshCatalogAsync();
-        Servers.Clear();
-        foreach (var s in _sub.Servers) Servers.Add(s);
-        SelectedServer = Servers.FirstOrDefault(s => s.Id == _sub.SelectedServerId) ?? Servers.FirstOrDefault();
+        var previousId = SelectedServer?.Id;
+        _updatingCatalog = true;
+        try
+        {
+            Servers.Clear();
+            foreach (var s in _sub.Servers) Servers.Add(s);
+            SelectedServer = Servers.FirstOrDefault(s => s.Id == _sub.SelectedServerId) ?? Servers.FirstOrDefault();
+        }
+        finally { _updatingCatalog = false; }
+        SaveLocation(SelectedServer);
+        if (previousId is not null && previousId != SelectedServer?.Id)
+            _ = StopForSwitchAsync();
         ErrorText = _sub.LastError;
     }
 
     [RelayCommand]
     private async Task ToggleAsync()
     {
-        if (Status is TunnelStatus.Connected or TunnelStatus.Connecting or TunnelStatus.Reasserting)
-        {
-            _settings.WasConnected = false;
-            _settings.Save();
-            await _tunnel.StopAsync();
-            return;
-        }
-
-        ErrorText = null;
-        if (SelectedServer is null)
-        {
-            await LoadCatalogAsync();
-            if (SelectedServer is null) { ErrorText = "Нет доступных серверов"; return; }
-        }
-
-        Status = TunnelStatus.Connecting;
-        await _split.RefreshAsync();
-        var raw = await _sub.ResolveSelectedAsync();
-        if (raw is null)
-        {
-            Status = TunnelStatus.Error;
-            ErrorText = _sub.LastError ?? "Не удалось получить конфигурацию. Проверьте ключ и сеть.";
-            return;
-        }
-
-        string cfg;
-        if (_sub.SelectedProtoId == "hysteria2")
-        {
-            cfg = Hy2Config.Build(raw, _split.DirectCidrs(), _split.ViaVpn);
-            _endpointHost = Hy2Config.EndpointHost(raw);
-        }
-        else
-        {
-            cfg = AwgConfig.EnsureMtu(AwgConfig.WithAllowedIPs(raw, _split.TunnelAllowedIPs()));
-            _endpointHost = AwgConfig.EndpointHost(cfg);
-        }
-        if (_tunnel is IProtocolRouter r) r.Protocol = _sub.SelectedProtoId;
+        await _tunnelOperation.WaitAsync();
         try
         {
-            await _tunnel.StartAsync(cfg);
+            if (_tunnel.Status is TunnelStatus.Connected or TunnelStatus.Connecting or TunnelStatus.Reasserting)
+            {
+                await StopTunnelAsync();
+                return;
+            }
+
+            ErrorText = null;
+            if (SelectedServer is null)
+            {
+                await LoadCatalogAsync();
+                if (SelectedServer is null) { ErrorText ??= "Нет доступных серверов"; return; }
+            }
+
+            MatchProtocolToLocation();
+            using var cancellation = new CancellationTokenSource();
+            _connecting = cancellation;
+            var ct = cancellation.Token;
+            var serverId = SelectedServer.Id;
+            var protocol = SelectedProto;
+            Status = TunnelStatus.Connecting;
+            // A split-tunnel refresh is optional. A slow services request
+            // must not delay a connection with already loaded routes.
+            var raw = await _sub.ResolveSelectedAsync(ct);
+            ct.ThrowIfCancellationRequested();
+            if (raw is null)
+            {
+                Status = TunnelStatus.Error;
+                ErrorText = _sub.LastError ?? "Не удалось получить конфигурацию для выбранной локации.";
+                return;
+            }
+            if (SelectedServer?.Id != serverId || SelectedProto != protocol)
+            {
+                Status = TunnelStatus.Disconnected;
+                return;
+            }
+
+            string config;
+            if (protocol == "hysteria2")
+            {
+                config = Hy2Config.Build(raw, _split.DirectCidrs(), _split.ViaVpn);
+                _endpointHost = Hy2Config.EndpointHost(raw);
+            }
+            else
+            {
+                config = AwgConfig.EnsureMtu(AwgConfig.WithAllowedIPs(raw, _split.TunnelAllowedIPs()));
+                _endpointHost = AwgConfig.EndpointHost(config);
+            }
+            if (_tunnel is IProtocolRouter router) router.Protocol = protocol;
+            await _tunnel.StartAsync(config, ct);
+            ct.ThrowIfCancellationRequested();
             _settings.WasConnected = true;
             _settings.Save();
         }
+        catch (OperationCanceledException)
+        {
+            Status = TunnelStatus.Disconnected;
+        }
         catch (Exception ex) { Status = TunnelStatus.Error; ErrorText = ex.Message; }
+        finally
+        {
+            _connecting = null;
+            _tunnelOperation.Release();
+        }
     }
 
     [RelayCommand]
     private async Task SelectProtoAsync(string? proto)
     {
         var p = proto == "hysteria2" ? "hysteria2" : "amneziaWG";
-        if (p == SelectedProto) return;
+        if (p == SelectedProto || SelectedServer?.Protocols.Contains(p) != true) return;
 
         await StopForSwitchAsync();
+        if (SelectedServer?.Protocols.Contains(p) != true) return;
+        SetProtocol(p);
+    }
+
+    private void MatchProtocolToLocation()
+    {
+        if (SelectedServer?.Protocols.Contains(SelectedProto) == true) return;
+        if (CanUseMatchaWg) SetProtocol("amneziaWG");
+        else if (CanUseHysteria2) SetProtocol("hysteria2");
+    }
+
+    private void SetProtocol(string p)
+    {
         SelectedProto = p;
         _sub.SelectedProtoId = p;
         _settings.Proto = p;
@@ -216,9 +266,7 @@ public partial class AppViewModel : ObservableObject
     [RelayCommand]
     private async Task SignOutAsync()
     {
-        _settings.WasConnected = false;
-        _settings.Save();
-        if (Status != TunnelStatus.Disconnected) await _tunnel.StopAsync();
+        await StopForSwitchAsync();
         _sub.SignOut();
         Servers.Clear();
         SelectedServer = null;
@@ -264,31 +312,40 @@ public partial class AppViewModel : ObservableObject
         _settings.Save();
     }
 
-    partial void OnSelectedServerChanged(CatalogServer? value)
+    partial void OnSelectedServerChanged(CatalogServer? oldValue, CatalogServer? newValue)
     {
-        if (value is null) return;
-        var changed = _sub.SelectedServerId != value.Id;
-        _sub.SelectedServerId = value.Id;
-        _settings.SelectedServerId = value.Id;
-        _settings.Save();
-
-        if (changed) _ = StopForSwitchAsync();
+        if (_updatingCatalog) return;
+        if (oldValue?.Id != newValue?.Id) _ = StopForSwitchAsync();
+        SaveLocation(newValue);
     }
 
-    private int _switchBusy;
+    private void SaveLocation(CatalogServer? server)
+    {
+        _sub.SelectedServerId = server?.Id;
+        _settings.SelectedServerId = server?.Id;
+        _settings.Save();
+        MatchProtocolToLocation();
+    }
 
     private async Task StopForSwitchAsync()
     {
-        if (Status is TunnelStatus.Disconnected) return;
-        if (Interlocked.Exchange(ref _switchBusy, 1) == 1) return;
+        _connecting?.Cancel();
+        await _tunnelOperation.WaitAsync();
         try
         {
-            _settings.WasConnected = false;
-            _settings.Save();
-            await _tunnel.StopAsync();
+            if (_tunnel.Status != TunnelStatus.Disconnected || Status != TunnelStatus.Disconnected)
+                await StopTunnelAsync();
         }
         catch (Exception ex) { Status = TunnelStatus.Error; ErrorText = ex.Message; }
-        finally { Interlocked.Exchange(ref _switchBusy, 0); }
+        finally { _tunnelOperation.Release(); }
+    }
+
+    private async Task StopTunnelAsync()
+    {
+        _settings.WasConnected = false;
+        _settings.Save();
+        await _tunnel.StopAsync();
+        Status = TunnelStatus.Disconnected;
     }
 
     partial void OnRuEnabledChanged(bool value)
@@ -307,6 +364,7 @@ public partial class AppViewModel : ObservableObject
 
     private void OnTunnelStatus(TunnelStatus s) => Dispatcher.UIThread.Post(() =>
     {
+        if (s != _tunnel.Status) return;
         Status = s;
         switch (s)
         {

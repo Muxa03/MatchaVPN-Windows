@@ -9,7 +9,7 @@ public interface ITunnelController
     ulong TxBytes { get; }
     event Action<TunnelStatus>? StatusChanged;
 
-    Task StartAsync(string awgConfig);
+    Task StartAsync(string awgConfig, CancellationToken cancellationToken = default);
     Task StopAsync();
 }
 
@@ -31,10 +31,11 @@ public sealed class StubTunnelController : ITunnelController
         };
     }
 
-    public async Task StartAsync(string awgConfig)
+    public async Task StartAsync(string awgConfig, CancellationToken cancellationToken = default)
     {
         Set(TunnelStatus.Connecting);
-        await Task.Delay(900);
+        try { await Task.Delay(900, cancellationToken); }
+        catch (OperationCanceledException) { Set(TunnelStatus.Disconnected); throw; }
         RxBytes = 0; TxBytes = 0;
         _t.Start();
         Set(TunnelStatus.Connected);
